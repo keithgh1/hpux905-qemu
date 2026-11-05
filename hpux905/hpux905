@@ -1,0 +1,106 @@
+#!/bin/bash
+# Container entrypoint: install HP-UX 9.05 onto /data, then boot it.
+set -euo pipefail
+
+HERE=/opt/hpux905
+QEMU=$HERE/bin/qemu-system-hppa
+QEMU_IMG=$HERE/bin/qemu-img
+DATA=/data
+DISK=$DATA/hpux905.qcow2
+export SERIAL_LOG=$DATA/serial.log SERIAL_MARK=/tmp/serial.mark
+
+usage() {
+    cat <<'EOF'
+HP-UX 9.05 on QEMU -M 715 (HP 9000/715)
+
+  install [--force]   unattended install onto /data/hpux905.qcow2 (about 10 minutes)
+  run                 boot the installed system: VNC on port 5900, serial console
+                      on this terminal (with -it) or on port 4555
+  shell               shell inside the container
+
+Mounts: /iso   the HP-UX 9.05 S700 Install (B2826-13668) and Core (B2826-13669) ISOs
+        /data  the disk image and logs
+EOF
+}
+
+find_iso() {
+    local f
+    for f in /iso/*"$1"*.iso /data/*"$1"*.iso; do
+        [ -f "$f" ] && { echo "$f"; return; }
+    done
+    echo "error: no ISO matching *$1*.iso in /iso" >&2
+    exit 1
+}
+
+# Common machine: SCSI disk at ID 6 presented as a model listed in HP-UX's
+# /etc/disktab, CD at ID 2 (always present: the if=scsi drive creates scsi.0).
+# HP-UX 9 never sends SYNCHRONIZE CACHE, so the disk is writethrough.
+machine_args() {   # $1 boot device (c|d), $2 CD image or ""
+    local cd="if=scsi,index=2,media=cdrom"
+    [ -n "$2" ] && cd="file=$2,$cd,format=raw"
+    ARGS=(-M 715 -m 128 -L "$HERE/share"
+          -drive "$cd"
+          -drive "file=$DISK,if=none,id=hd6,format=qcow2,cache=writethrough"
+          -device scsi-hd,drive=hd6,bus=scsi.0,scsi-id=6,vendor=SEAGATE,product=ST12400N
+          -boot order="$1" -nic user)
+}
+
+# Artist graphics on VNC; firmware and kernel console stay on serial.
+# -icount keeps the X server's delay-loop calibration sane.
+GFX_ARGS=(-display none -vnc 0.0.0.0:0 -fw_cfg opt/console,string=serial -icount shift=4)
+TEXT_ARGS=(-display none -vga none)
+
+# Background guest for scripted use: serial logged to $SERIAL_LOG, HMP on 4556.
+start_bg() {
+    "$QEMU" "${ARGS[@]}" "$@" \
+        -chardev "socket,id=ser0,host=127.0.0.1,port=4555,server=on,wait=off,logfile=$SERIAL_LOG,logappend=on" \
+        -serial chardev:ser0 \
+        -monitor tcp:127.0.0.1:4556,server=on,wait=off &
+    QPID=$!
+    sleep 2
+    kill -0 "$QPID" 2>/dev/null || { echo "error: QEMU failed to start" >&2; exit 1; }
+}
+
+# HMP quit lets QEMU flush the qcow2 metadata.
+stop_bg() {
+    python3 -I "$HERE/con.py" mon quit >/dev/null 2>&1 || true
+    wait "$QPID" || true
+}
+
+cmd_run() {
+    [ -f "$DISK" ] || { echo "error: $DISK not found; run 'install' first" >&2; exit 1; }
+    local cd=""
+    cd=$(find_iso 13669 2>/dev/null) || true
+    machine_args c "$cd"
+    echo "HP-UX 9.05 booting. VNC: port 5900 (screen saver starts blank: move the mouse)."
+    echo "Log in as root, no password. Stop: 'shutdown -h 0' in HP-UX, or docker stop."
+    if [ -t 0 ]; then
+        echo "Serial console on this terminal; Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor."
+        exec "$QEMU" "${ARGS[@]}" "${GFX_ARGS[@]}" -serial mon:stdio
+    else
+        echo "Serial console: telnet to port 4555."
+        exec "$QEMU" "${ARGS[@]}" "${GFX_ARGS[@]}" \
+            -chardev socket,id=ser0,host=0.0.0.0,port=4555,server=on,wait=off,telnet=on \
+            -serial chardev:ser0
+    fi
+}
+
+cmd_install() {
+    if [ -f "$DISK" ] && [ "${1:-}" != "--force" ]; then
+        echo "error: $DISK exists; use 'install --force' to replace it" >&2
+        exit 1
+    fi
+    ln -sf "$(find_iso 13668)" /tmp/install.iso
+    ln -sf "$(find_iso 13669)" /tmp/core.iso
+    rm -f "$DISK"
+    "$QEMU_IMG" create -q -f qcow2 "$DISK" $((4194685 * 512))
+    : > "$SERIAL_LOG"
+    source "$HERE/install.sh"
+}
+
+case "${1:-help}" in
+    install) shift; cmd_install "$@" ;;
+    run)     cmd_run ;;
+    shell)   exec bash ;;
+    *)       usage ;;
+esac
